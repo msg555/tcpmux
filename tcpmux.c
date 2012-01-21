@@ -1,10 +1,12 @@
 #include <assert.h>
-#include <errno.h>
-#include <fcntl.h>
-#include <netdb.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
+#include <signal.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/types.h>
@@ -42,6 +44,7 @@ static int socket_connected(int s) {
 
 int main(int argc, char** argv) {
   srand(time(NULL));
+  signal(SIGPIPE, SIG_IGN);
 
   int demux = 0;
   int retry_dns = 0;
