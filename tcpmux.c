@@ -10,8 +10,8 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 
-#define VLOG(s) //puts(s)
-#define VVLOG(s) //puts(s)
+#define VLOG(s) puts(s)
+#define VVLOG(s) puts(s)
 
 static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo);
 
@@ -57,8 +57,11 @@ int main(int argc, char** argv) {
     printf(
 "tcpmux is a tool built to multiplex several tcp connections over a single\n"
 "connection.  tcpmux expects that it has an instance running with the same\n"
-"options with the server given the --demux switch\n\n");
-    printf("tcpdump [options] "
+"options (unless otherwise stated) with the server given the --demux switch.\n"
+"By default tcpmux will bind to the loopback iterface in 'mux' mode and\n"
+"the wildcard address (INADDR_ANY) in 'demux' mode.  You can use * as the\n"
+"bind_addr to force the wildcard address to be used.\n\n");
+    printf("tcpmux [options] "
            "[bind_addr:]bind_port connect_addr:connect_port\n\n");
     printf("  [optons]\n");
     // TODO: Make optional?
@@ -109,11 +112,17 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  int wild = 0;
+  if(baddr && !strcmp(baddr, "*")) {
+    wild = 1;
+    baddr = NULL;
+  }
+
   /* Figure out the address to bind to and bind. */
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
-  hints.ai_flags = AI_PASSIVE;
+  hints.ai_flags = demux || wild ? AI_PASSIVE : 0;
   if(getaddrinfo(baddr, bport, &hints, &baddrinfo)) {
     perror("getaddrinfo");
     return 1;
