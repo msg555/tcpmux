@@ -691,33 +691,9 @@ static int mainr(mux_context* mc) {
         /* It's a control packet. */
         read_ack(mc);
       } else {
+        client_data* cd = get_client(mc, mc->rin.id);
+        if(!cd) return 1;
 
-        /* It's a client packet. */
-        if(mc->demux && mc->rin.id >= mc->client_table_size &&
-           mc->rin.id < MAX_CLIENTS) {
-          mc->client_table =
-              (client_data**)realloc(mc->client_table,
-                                     sizeof(client_data*) * (mc->rin.id * 2));
-          if(!mc->client_table) {
-            fprintf(stderr, "Failed to allocate client table\n");
-            return 1;
-          }
-          memset(mc->client_table + mc->client_table_size, 0,
-              sizeof(mux_context*) * (mc->rin.id * 2 - mc->client_table_size));
-          mc->client_table_size = 2 * mc->rin.id;
-        }
-        if(mc->rin.id < 0 || mc->rin.id >= mc->client_table_size) {
-          fprintf(stderr, "Got unexpected vpacket id\n");
-          return 1;
-        }
-        client_data* cd = mc->client_table[mc->rin.id];
-        if(!cd) {
-          if(mc->demux) {
-            mc->client_table[mc->rin.id] = cd = allocate_client(mc);
-            int res = initiate_client_connect(cd);
-            if(res) return res;
-          }
-        }
         if(sizeof(cd->out_buf) - cd->out_sz < mc->rin.sz) {
           fprintf(stderr, "No room for incoming packet (karma error)\n");
           return 1;
