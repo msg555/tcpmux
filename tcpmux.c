@@ -11,9 +11,12 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <time.h>
+#include <unistd.h>
 
-#define VLOG(s) puts(s)
-#define VVLOG(s) puts(s)
+#define CLOG(s) puts(s)
+#define VLOG(s) //puts(s)
+#define VVLOG(s) //puts(s)
 
 static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo);
 
@@ -122,12 +125,13 @@ int main(int argc, char** argv) {
   }
 
   /* Figure out the address to bind to and bind. */
+  int res;
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = AF_INET;
   hints.ai_socktype = SOCK_STREAM;
   hints.ai_flags = demux || wild ? AI_PASSIVE : 0;
-  if(getaddrinfo(baddr, bport, &hints, &baddrinfo)) {
-    perror("getaddrinfo");
+  if((res = getaddrinfo(baddr, bport, &hints, &baddrinfo))) {
+    fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(res));
     return 1;
   }
   if(baddrinfo == NULL) {
@@ -158,8 +162,8 @@ int main(int argc, char** argv) {
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
-    if(getaddrinfo(caddr, cport, &hints, &caddrinfo)) {
-      perror("getaddrinfo");
+    if((res = getaddrinfo(caddr, cport, &hints, &caddrinfo))) {
+      fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(res));
       if(retry_dns) {
         continue;
       } else {
@@ -177,7 +181,7 @@ int main(int argc, char** argv) {
     break;
   }
 
-  int res = muxloop(sserv, demux, caddrinfo);
+  res = muxloop(sserv, demux, caddrinfo);
   fprintf(stderr, "mux loop unexpectedly exited\n");
   return res;
 }
@@ -196,6 +200,7 @@ typedef struct client_data {
   int is_client; /* Must be at the beginning of the struct.  Must be 1. */
   int is_connecting;
   int is_burned;
+  int is_rdead;
   struct mux_context* context;
 
   int s;
@@ -302,27 +307,78 @@ static int initiate_client_connect(client_data* cd) {
   return 0;
 }
 
-static client_data* allocate_client(mux_context* mc) {
+static int push_writer(mux_context* mc, client_data* cd, int from_mainw) {
+  if(cd->next) return 0; /* This shouldn't happen often. */
+  if(mc->write_head) {
+    mc->write_tail->next = cd;
+    mc->write_tail = cd;
+  } else {
+    mc->write_head = mc->write_tail = cd;
+
+    /* Try pushing some data out if possible. */
+    return from_mainw ? 0 : mainw(mc);
+  }
+  return 0;
+}
+
+static void set_rkarma(client_data* cd, int nkarma, int from_mainw) {
+  mux_context* mc = cd->context;
+  int noqueue = 0 <= cd->rkarma && cd->rkarma < ACK_THRESHOLD;
+  cd->rkarma = nkarma;
+  if(noqueue && (nkarma == -1 || ACK_THRESHOLD <= nkarma)) {
+    assert(cd->karma_next == NULL);
+    if(mc->karma_head) {
+      mc->karma_tail->karma_next = cd;
+      mc->karma_tail = cd;
+    } else {
+      mc->karma_head = mc->karma_tail = cd;
+      if(mc->rstream_karma < ACK_THRESHOLD) {
+        push_writer(mc, *mc->client_table, from_mainw);
+      }
+    }
+  }
+}
+
+static int disconnect_client(client_data* cd, int from_mainw) {
+  VLOG("Disconnecting client");
+  mux_context* mc = cd->context;
+  if(epoll_ctl(mc->epollfd, EPOLL_CTL_DEL, cd->s, NULL)) {
+    perror("epoll_ctl");
+    return 1;
+  }
+  close(cd->s);
+  cd->s = -1;
+  set_rkarma(cd, -1, from_mainw);
+  return 0;
+}
+
+static client_data* allocate_client(mux_context* mc, int nid) {
   /* This naieve implementation should be ok for less than 1,000 connections. */
-  int nid;
-  for(nid = 0; nid < mc->client_table_size && mc->client_table[nid]; nid++);
-  if(nid >= mc->client_table_size) {
+  if(nid == -1) {
+    for(nid = 0; nid < mc->client_table_size && mc->client_table[nid]; nid++);
+  }
+  while(nid >= mc->client_table_size) {
     int nsz = mc->client_table_size * 3 / 2 + 4;
     mc->client_table = (client_data**)
         realloc(mc->client_table, sizeof(client_data*) * nsz);
     if(!mc->client_table) {
-      fprintf(stderr, "Failed to allocate client table\n");
+      fprintf(stderr, "Failed to allocate client table %d\n", nsz);
       return NULL;
     }
     memset(mc->client_table + mc->client_table_size, 0,
            sizeof(client_data*) * (nsz - mc->client_table_size));
     mc->client_table_size = nsz;
   }
+  if(mc->client_table[nid]) {
+    fprintf(stderr, "Assigned id already in use\n");
+    return NULL;
+  }
   client_data* cd = calloc(1, sizeof(client_data));
   if(!cd) {
     fprintf(stderr, "Could not allocate client\n");
     return NULL;
   }
+
   cd->is_client = 1;
   cd->context = mc;
   cd->id = nid;
@@ -331,7 +387,7 @@ static client_data* allocate_client(mux_context* mc) {
   return mc->client_table[nid] = cd;
 }
 
-client_data* get_client(mux_context* mc, int id) {
+client_data* get_client(mux_context* mc, int id, int from_mainw) {
   if(id < 0 || id >= MAX_CLIENTS) return NULL;
   if(id < mc->client_table_size && mc->client_table[id]) {
     return mc->client_table[id];
@@ -342,27 +398,9 @@ client_data* get_client(mux_context* mc, int id) {
     return NULL;
   }
 
-  /* Otherwise we're a server and need to connect and create a new client. */
-  if(id >= mc->client_table_size) {
-    client_data** ptab = mc->client_table;
-    mc->client_table = (client_data**)realloc(mc->client_table,
-                               sizeof(client_data*) * (mc->rin.id * 2));
-    if(!mc->client_table) {
-      mc->client_table = ptab;
-      fprintf(stderr, "Failed to allocate client table\n");
-      return NULL;
-    }
-    memset(mc->client_table + mc->client_table_size, 0,
-        sizeof(mux_context*) * (mc->rin.id * 2 - mc->client_table_size));
-    mc->client_table_size = 2 * mc->rin.id;
-  }
-
-  client_data* cd = mc->client_table[id] = allocate_client(mc);
+  client_data* cd = mc->client_table[id] = allocate_client(mc, id);
   if(initiate_client_connect(cd)) {
-    mc->client_table[id] = NULL;
-    cd->is_burned = 1;
-    cd->burn_next = mc->burn_list;
-    mc->burn_list = cd;
+    disconnect_client(cd, from_mainw);
   }
   cd->wkarma = 0;
   return cd;
@@ -387,7 +425,7 @@ mux_context* make_context(int demux, int epollfd, struct addrinfo* caddrinfo) {
   mc->caddrinfo = caddrinfo;
   mc->mainfd = -1;
   mc->stream_karma = GLOBAL_KARMA - 1;
-  allocate_client(mc); /* Create the dummy control client. */
+  allocate_client(mc, 0); /* Create the dummy control client. */
   return mc;
 }
 
@@ -404,23 +442,8 @@ static int generate_key(mux_context* mc) {
   return 0;
 }
 
-static int push_writer(mux_context* mc, client_data* cd, int from_mainw) {
-  if(cd->next) return 0; /* This shouldn't happen often. */
-  if(mc->write_head) {
-    mc->write_tail->next = cd;
-    mc->write_tail = cd;
-  } else {
-    mc->write_head = mc->write_tail = cd;
-
-    /* Try pushing some data out if possible. */
-    return from_mainw ? 0 : mainw(mc);
-  }
-  return 0;
-}
-
 static void write_cbuf(char* cdata, int opos, int* csz, int cmxsz,
                        const void* wdata, int wsz, int rotsz) {
-  int wpos = 0;
   while(wsz > 0) {
     int cpos = opos + *csz;
     cpos -= cpos >= cmxsz ? cmxsz : 0;
@@ -479,24 +502,7 @@ static int initiate_main_connect(mux_context* mc) {
     perror("epoll_ctl");
     return 1;
   }
-}
-
-static void set_rkarma(client_data* cd, int nkarma, int from_mainw) {
-  mux_context* mc = cd->context;
-  int noqueue = 0 <= cd->rkarma && cd->rkarma < ACK_THRESHOLD;
-  cd->rkarma = nkarma;
-  if(noqueue && (nkarma == -1 || ACK_THRESHOLD <= nkarma)) {
-    assert(cd->karma_next == NULL);
-    if(mc->karma_head) {
-      mc->karma_tail->karma_next = cd;
-      mc->karma_tail = cd;
-    } else {
-      mc->karma_head = mc->karma_tail = cd;
-      if(mc->rstream_karma < ACK_THRESHOLD) {
-        push_writer(mc, *mc->client_table, from_mainw);
-      }
-    }
-  }
+  return 0;
 }
 
 static ssize_t write_mainfd(mux_context* mc, const void* buf, size_t count) {
@@ -506,7 +512,7 @@ static ssize_t write_mainfd(mux_context* mc, const void* buf, size_t count) {
     return amt;
   }
   mc->stream_karma -= amt;
-  write_cbuf(mc->stream, 0, &mc->stream_pos, GLOBAL_KARMA, buf, count, 1);
+  write_cbuf(mc->stream, 0, &mc->stream_pos, GLOBAL_KARMA, buf, amt, 1);
   return amt;
 }
 
@@ -516,30 +522,41 @@ static void read_ack(mux_context* mc) {
   int* data = (int*)mc->rin.buf;
   int* edata = (int*)(mc->rin.buf + mc->rin.sz);
   mc->stream_karma += ntohl(*data++);
+  // TODO: Shouldn't be an assert.
   assert(0 <= mc->stream_karma && mc->stream_karma <= GLOBAL_KARMA);
   for(; data + 2 <= edata; ) {
     int id = ntohl(*data++);
     int karma = ntohl(*data++);
-    client_data* cd = get_client(mc, id);
-    if(cd == NULL) continue;
-
-    cd->wkarma += karma;
-    if(!cd->is_connecting && cd->wkarma == karma) {
-      /* We just made room for this client to send more data.  Give it a chance
-       * to write mroe data. */
-      push_writer(mc, cd, 0);
+    client_data* cd = get_client(mc, id, 0);
+    if(cd == NULL) {
+      VLOG("Missing client?\n");
+      continue;
     }
 
-    if(karma == -1) {
+    if(karma >= 0) {
+      cd->wkarma += karma;
+      if(!cd->is_connecting && cd->wkarma == karma) {
+        /* We just made room for this client to send more data.  Give it a
+         * chance to write mroe data. */
+        push_writer(mc, cd, 0);
+      }
+    } else {
       /* This is actually a disconnect message. */
       if(cd->s != -1) {
-        disconnect_client(cd);
-        cd->context = NULL;
-      } else {
+        /* We still thought the client was up.  Disconnect it and mark it as
+         * disconnected. */
+        cd->is_rdead = 1;
+        disconnect_client(cd, 0);
+      } else if(cd->rkarma == 0) {
+        /* We knew the client was down and have already sent notice of this. */
         mc->client_table[id] = NULL;
         cd->is_burned = 1;
         cd->burn_next = mc->burn_list;
         mc->burn_list = cd;
+      } else {
+        /* We knew the client was down but haven't sent notice yet.  Mark it so
+         * that when notice is sent it will be removed. */
+        cd->is_rdead = 1;
       }
     }
   }
@@ -558,13 +575,15 @@ static void write_ack(mux_context* mc) {
     client_data* cd = mc->karma_head;
     assert(cd->rkarma == -1 ||
            (ACK_THRESHOLD <= cd->rkarma && cd->rkarma <= CLIENT_KARMA));
+    assert(!cd->is_rdead || cd->rkarma == -1);
     *data++ = htonl(cd->id);
     *data++ = htonl(cd->rkarma);
     cd->rkarma = 0;
     mc->karma_head = cd->karma_next;
     cd->karma_next = NULL;
     
-    if(!cd->context) {
+    if(cd->is_rdead) {
+      /* If the client was marked as disconnected burn the client. */
       mc->client_table[cd->id] = NULL;
       cd->is_burned = 1;
       cd->burn_next = mc->burn_list;
@@ -584,19 +603,6 @@ static int disconnect_main(mux_context* mc) {
   close(mc->mainfd);
   mc->mainfd = -1;
   return mc->demux ? 0 : initiate_main_connect(mc);
-}
-
-int disconnect_client(client_data* cd, int from_mainw) {
-  VLOG("Disconnecting client");
-  mux_context* mc = cd->context;
-  if(epoll_ctl(mc->epollfd, EPOLL_CTL_DEL, cd->s, NULL)) {
-    perror("epoll_ctl");
-    return 1;
-  }
-  close(cd->s);
-  cd->s = -1;
-  set_rkarma(cd, -1, from_mainw);
-  return 0;
 }
 
 static int mainr(mux_context* mc) {
@@ -628,14 +634,10 @@ static int mainr(mux_context* mc) {
     }
 
     ssize_t amt = read(mc->mainfd, buf, count);
-    if(amt == 0 || (amt == -1 && errno == ECONNRESET)) {
+    if(amt == 0 || (amt == -1 && errno != EAGAIN)) {
       return disconnect_main(mc);
     } else if(amt == -1) {
-      if(errno == EAGAIN) {
-        return 0;
-      }
-      perror("read mainfd");
-      return 1;
+      return 0;
     }
 
     if(rsz == -1) {
@@ -648,6 +650,11 @@ static int mainr(mux_context* mc) {
           if(ctx->handshake_st == KEYSZ + sizeof(int) &&
              !memcmp(mc->key, ctx->key, KEYSZ)) {
             VLOG("Key matchup");
+            if(ctx->mainfd != -1) {
+              int res = disconnect_main(ctx);
+              if(res) return 1;
+            }
+
             ctx->handshake_st = mc->handshake_st;
             ctx->mainfd = mc->mainfd;
             mc->is_burned = 1;
@@ -669,13 +676,18 @@ static int mainr(mux_context* mc) {
       } else if(mc->handshake_st == KEYSZ + sizeof(int)) {
         mc->stream_debt = mc->stream_pos - ntohl(mc->stream_debt);
         mc->stream_debt += mc->stream_debt < 0 ? GLOBAL_KARMA : 0;
+        mainw(mc); /* Give us a chance to write our debts now. */
       }
       continue;
     }
 
+    mc->rstream_pos += amt;
+    if(mc->rstream_pos >= GLOBAL_KARMA) {
+      mc->rstream_pos -= GLOBAL_KARMA;
+    }
+
     /* Check if we have new data to acknowledge. */
     mc->rstream_karma += amt;
-    mc->rstream_pos += amt;
     mc->rstream_pos -= mc->rstream_pos >= GLOBAL_KARMA ? GLOBAL_KARMA : 0;
     if(!mc->karma_head &&
        mc->rstream_karma - amt < ACK_THRESHOLD &&
@@ -694,7 +706,7 @@ static int mainr(mux_context* mc) {
         /* It's a control packet. */
         read_ack(mc);
       } else {
-        client_data* cd = get_client(mc, mc->rin.id);
+        client_data* cd = get_client(mc, mc->rin.id, 0);
         if(!cd) return 1;
 
         if(sizeof(cd->out_buf) - cd->out_sz < mc->rin.sz) {
@@ -714,6 +726,10 @@ static int mainr(mux_context* mc) {
 
 static int mainw(mux_context* mc) {
   if(mc->is_burned || mc->mainfd == -1 || mc->is_connecting) return 0;
+
+  /* Make sure we're not still doing a handshake. */
+  if(mc->handshake_st < KEYSZ + sizeof(int)) return 0;
+
   while(mc->write_head) {
     while(mc->stream_debt > 0) {
       VLOG("Absolving stream debt");
@@ -724,14 +740,10 @@ static int mainw(mux_context* mc) {
         sz -= mc->stream_pos;
       }
       ssize_t amt = write(mc->mainfd, mc->stream + pos, sz);
-      if(amt == 0 || (amt == -1 && errno == ECONNRESET)) {
+      if(amt == 0 || (amt == -1 && errno != EAGAIN)) {
         return disconnect_main(mc);
       } else if(amt == -1) {
-        if(errno == EAGAIN) {
-          return 0;
-        }
-        perror("write");
-        return 1;
+        return 0;
       }
       mc->stream_debt -= amt;
     }
@@ -763,18 +775,14 @@ static int mainw(mux_context* mc) {
         while(mc->wout.sz < mxsz) {
           ssize_t amt = read(cd->s, mc->wout.buf + mc->wout.sz,
                              mxsz - mc->wout.sz);
-          if((amt == -1 && (errno == EAGAIN || errno == ECONNRESET)) ||
-              amt == 0) {
+          if(amt <= 0) {
             buffer_empty = 1;
-            if((amt == -1 && errno == ECONNRESET) ||
-               (amt == 0 && mc->wout.sz == 0)) {
+            if(mc->wout.sz == 0 &&
+               (amt == 0 || (amt == -1 && errno != EAGAIN))) {
               int res = disconnect_client(cd, 1);
               if(res) return res;
             }
             break;
-          } else if(amt == -1) {
-            perror("read cd->s");
-            return 1;
           }
           mc->wout.sz += amt;
         }
@@ -814,14 +822,10 @@ static int mainw(mux_context* mc) {
       }
       numb = mc->wsz - mc->wpos < numb ? mc->wsz - mc->wpos : numb;
       ssize_t amt = write_mainfd(mc, ((char*)&mc->wout) + mc->wpos, numb);
-      if(amt == 0 || (amt == -1 && errno == ECONNRESET)) {
+      if(amt == 0 || (amt == -1 && errno != EAGAIN)) {
         return disconnect_main(mc);
       } else if(amt == -1) {
-        if(errno == EAGAIN) {
-          return 0;
-        }
-        perror("write");
-        return 1;
+        return 0;
       }
       mc->wpos += amt;
     }
@@ -845,14 +849,10 @@ static int clientw(client_data* cd) {
     sz = cd->out_sz < sz ? cd->out_sz : sz;
 
     ssize_t amt = write(cd->s, cd->out_buf + cd->out_pos, sz);
-    if(amt == 0 || (amt == -1 && errno == ECONNRESET)) {
+    if(amt == 0 || (amt == -1 && errno != EAGAIN)) {
       return disconnect_client(cd, 0);
     } else if(amt == -1) {
-      if(errno == EAGAIN) {
-        return 0;
-      }
-      perror("write");
-      return 1; 
+      return 0;
     }
 
     int noqueue = 0 <= cd->rkarma && cd->rkarma < ACK_THRESHOLD;
@@ -910,8 +910,7 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo) {
         printf("Dropping main connections\n");
         mux_context* mc = context_list;
         if(mc) do {
-          close(mc->mainfd);
-          mc->mainfd = -1;
+          disconnect_main(mc);
           mc = mc->next_context;
         } while(mc != context_list);
         continue;
@@ -947,7 +946,7 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo) {
           ev.data.ptr = mc;
         } else {
           VLOG("Got new connection.  Creating client...");
-          client_data* cd = allocate_client(mmc);
+          client_data* cd = allocate_client(mmc, -1);
           if(!cd) {
             return 1;
           }
@@ -978,11 +977,11 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo) {
         int res;
         if(ei->events & EPOLLIN) {
           VVLOG("Client ready to read");
-          if(res = clientr(cd)) return res;
+          if((res = clientr(cd))) return res;
         }
         if(ei->events & EPOLLOUT) {
           VVLOG("Client ready to write");
-          if(res = clientw(cd)) return res;
+          if((res = clientw(cd))) return res;
         }
       } else {
         /* It's the main file descriptor. */
@@ -1000,11 +999,11 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo) {
         int res;
         if(ei->events & EPOLLIN) {
           VLOG("Main ready to read");
-          if(res = mainr(mc)) return res;
+          if((res = mainr(mc))) return res;
         }
         if(ei->events & EPOLLOUT) {
           VLOG("Main ready to write");
-          if(res = mainw(mc)) return res;
+          if((res = mainw(mc))) return res;
         }
       }
     }
