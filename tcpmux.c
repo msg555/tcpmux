@@ -17,6 +17,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <net/if.h>
+
 /* Switches used to disable parts of tcpmux.
  *
  * NO_ZIP - Disable usage of zlib library to compress data.
@@ -997,12 +1001,37 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
     }
   }
 
+  int snl = -1;
   mux_context* mmc = NULL;
   if(!demux) {
     mux_context* mc = mmc = make_context(demux, epollfd, caddrinfo);
     if(!mc) return 1;
     if(generate_key(mc)) return 1;
     if(initiate_main_connect(mc)) return 1;
+
+    struct sockaddr_nl addr;
+    snl = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
+    if(setnonblocking(snl)) return 1;
+    if(snl == -1) {
+      perror("socket nl");
+      return 1;
+    }
+
+    memset(&addr, 0, sizeof(addr));
+    addr.nl_family = AF_NETLINK;
+    addr.nl_groups = RTMGRP_IPV4_IFADDR;
+    if(bind(snl, (struct sockaddr*)&addr, sizeof(addr)) == -1) {
+      perror ("bind nl");
+      return 1;
+    }
+
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ev.data.ptr = &snl;
+    if(epoll_ctl(epollfd, EPOLL_CTL_ADD, snl, &ev)) {
+      perror("epoll_ctl");
+      return 1;
+    }
   }
 
   while(1) {
@@ -1053,6 +1082,33 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
         char buf[64];
         write(cs, buf, sprintf(buf, "\n%u %u\n", ntohl(rtt), ntohl(rttvar)));
         close(cs);
+      } else if(ei->data.ptr == &snl) {
+        int len;
+        char buf[4096];
+        int new_addr = 0;
+        while((len = recv(snl, &buf, sizeof(buf), 0)) > 0) {
+          struct nlmsghdr* nlh = (struct nlmsghdr*)buf;
+          for (; NLMSG_OK(nlh, (size_t)len) && nlh->nlmsg_type != NLMSG_DONE;
+                 nlh = NLMSG_NEXT(nlh, len)) {
+            switch((int)nlh->nlmsg_type) {
+              case RTM_NEWADDR:  case RTM_DELADDR:
+              case RTM_NEWLINK:  case RTM_DELLINK:
+              case RTM_NEWROUTE: case RTM_DELROUTE:
+                new_addr = 1;
+                break;
+            }
+          }
+        }
+        if(new_addr) {
+          /* Network interfaces have changed.  Let's try connecting again
+           * to make sure we have the best interface. */
+          printf("Detected interface change\n");
+          mux_context* mc = context_list;
+          if(mc) do {
+            disconnect_main(mc);
+            mc = mc->next_context;
+          } while(mc != context_list);
+        }
       } else if(!ei->data.ptr) {
         union {
           struct sockaddr_in addrin;
