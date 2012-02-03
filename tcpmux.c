@@ -3,8 +3,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <netdb.h>
 #include <signal.h>
 #include <sys/epoll.h>
@@ -14,11 +17,24 @@
 #include <time.h>
 #include <unistd.h>
 
-#define CLOG(s) puts(s)
+/* Switches used to disable parts of tcpmux.
+ *
+ * NO_ZIP - Disable usage of zlib library to compress data.
+ * NO_SSL - Disable usage of SSL to encrypt data.
+ */
+
+// TODO: Use unsigned computation where appropriate.
+
+#ifndef NO_ZIP
+#include "zlib.h"
+#define Z_LEVEL Z_DEFAULT_COMPRESSION
+#endif
+
+#define CLOG(s) //puts(s)
 #define VLOG(s) //puts(s)
 #define VVLOG(s) //puts(s)
 
-static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo);
+static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo, int sctl);
 
 static int setnonblocking(int s) {
   assert(s != -1);
@@ -49,13 +65,26 @@ int main(int argc, char** argv) {
   srand(time(NULL));
   signal(SIGPIPE, SIG_IGN);
 
+  char* str;
   int demux = 0;
   int retry_dns = 0;
+  char* ctladdr = NULL;
+  char* ctlport = NULL;
   if(*argv) for(++argv, --argc; *argv && (*argv)[0] == '-'; ++argv, --argc) {
     if(!strcmp("--demux", *argv)) {
       demux = 1;
     } else if(!strcmp("--retry", *argv)) {
       retry_dns = 1;
+    } else if(!strcmp("--control", *argv) && argc > 1) {
+      ctlport = *++argv;
+      argc--;
+      for(str = argv[0]; *str; ++str) {
+        if(*str == ':') {
+          *str = 0;
+          ctladdr = argv[0];
+          ctlport = str + 1;
+        }
+      }
     }
   }
 
@@ -77,12 +106,13 @@ int main(int argc, char** argv) {
     //printf("  --ssl     : Encrypt stream with SSL\n");
     printf("  --retry   : "
                   "Keep trying to resolve connect host until it suceeds\n");
+    printf("  --control [control_bind_addr:]control_bind_port : "
+           "Start control server\n");
     // TODO: Add max client switch
     // TODO: Need to provide keys?
     return 0;
   }
 
-  char* str;
   char* baddr = NULL;
   char* bport = argv[0];
   char* caddr = NULL;
@@ -105,6 +135,7 @@ int main(int argc, char** argv) {
   struct addrinfo hints;
   struct addrinfo* baddrinfo;
   struct addrinfo* caddrinfo;
+  struct addrinfo* ctladdrinfo;
 
   /* Create the listening socket. */
   int sserv = socket(AF_INET, SOCK_STREAM, 0);
@@ -150,6 +181,50 @@ int main(int argc, char** argv) {
     return 1;
   }
 
+  int sctl = -1;
+  if(ctlport) {
+    sctl = socket(AF_INET, SOCK_STREAM, 0);
+    if(sctl == -1) {
+      perror("socket");
+      return 1;
+    }
+    int one = 1;
+    if(setsockopt(sctl, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one))) {
+      perror("setsockopt");
+      return 1;
+    }
+
+    int wild = 0;
+    if(ctladdr && !strcmp(ctladdr, "*")) {
+      wild = 1;
+      ctladdr = NULL;
+    }
+
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = wild ? AI_PASSIVE : 0;
+    if((res = getaddrinfo(ctladdr, ctlport, &hints, &ctladdrinfo))) {
+      fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(res));
+      return 1;
+    }
+    if(ctladdrinfo == NULL) {
+      fprintf(stderr, "Could not get bind address\n");
+      return 1;
+    }
+    if(bind(sctl, ctladdrinfo->ai_addr, ctladdrinfo->ai_addrlen)) {
+      perror("bind");
+      return 1;
+    }
+    freeaddrinfo(ctladdrinfo);
+
+    /* Set the socket listening. */
+    if(listen(sctl, 16)) {
+      perror("listen");
+      return 1;
+    }
+  }
+
   int iter;
   for(iter = 0; ; iter += iter < 7) {
     if(iter) {
@@ -181,7 +256,7 @@ int main(int argc, char** argv) {
     break;
   }
 
-  res = muxloop(sserv, demux, caddrinfo);
+  res = muxloop(sserv, demux, caddrinfo, sctl);
   fprintf(stderr, "mux loop unexpectedly exited\n");
   return res;
 }
@@ -263,6 +338,11 @@ typedef struct mux_context {
   int read_bytes;
   int rpos;
   message rin;
+
+#ifndef NO_ZIP
+  z_stream wstrm;
+  z_stream rstrm;
+#endif
 
   struct mux_context* next_context;
   struct mux_context* prev_context;
@@ -398,7 +478,7 @@ client_data* get_client(mux_context* mc, int id, int from_mainw) {
     return NULL;
   }
 
-  client_data* cd = mc->client_table[id] = allocate_client(mc, id);
+  client_data* cd = allocate_client(mc, id);
   if(initiate_client_connect(cd)) {
     disconnect_client(cd, from_mainw);
   }
@@ -443,7 +523,7 @@ static int generate_key(mux_context* mc) {
 }
 
 static void write_cbuf(char* cdata, int opos, int* csz, int cmxsz,
-                       const void* wdata, int wsz, int rotsz) {
+                       const char* wdata, int wsz, int rotsz) {
   while(wsz > 0) {
     int cpos = opos + *csz;
     cpos -= cpos >= cmxsz ? cmxsz : 0;
@@ -617,7 +697,7 @@ static int mainr(mux_context* mc) {
     if(mc->handshake_st < KEYSZ) {
       buf = mc->key + mc->handshake_st;
       count = KEYSZ - mc->handshake_st;
-    } else if(mc->handshake_st < KEYSZ + sizeof(int)) {
+    } else if(mc->handshake_st < KEYSZ + (int)sizeof(int)) {
       buf = ((char*)&mc->stream_debt) + mc->handshake_st - KEYSZ;
       count = sizeof(int) + KEYSZ - mc->handshake_st;
     } else {
@@ -709,7 +789,7 @@ static int mainr(mux_context* mc) {
         client_data* cd = get_client(mc, mc->rin.id, 0);
         if(!cd) return 1;
 
-        if(sizeof(cd->out_buf) - cd->out_sz < mc->rin.sz) {
+        if((int)sizeof(cd->out_buf) - cd->out_sz < mc->rin.sz) {
           fprintf(stderr, "No room for incoming packet (karma error)\n");
           return 1;
         }
@@ -728,7 +808,7 @@ static int mainw(mux_context* mc) {
   if(mc->is_burned || mc->mainfd == -1 || mc->is_connecting) return 0;
 
   /* Make sure we're not still doing a handshake. */
-  if(mc->handshake_st < KEYSZ + sizeof(int)) return 0;
+  if(mc->handshake_st < KEYSZ + (int)sizeof(int)) return 0;
 
   while(mc->write_head) {
     while(mc->stream_debt > 0) {
@@ -858,7 +938,8 @@ static int clientw(client_data* cd) {
     int noqueue = 0 <= cd->rkarma && cd->rkarma < ACK_THRESHOLD;
     cd->rkarma += amt;
     cd->out_pos += amt;
-    cd->out_pos -= cd->out_pos >= sizeof(cd->out_buf) ? sizeof(cd->out_buf) : 0;
+    cd->out_pos -= cd->out_pos >= (int)sizeof(cd->out_buf) ?
+                    sizeof(cd->out_buf) : 0;
     cd->out_sz -= amt;
 
     if(noqueue && ACK_THRESHOLD <= cd->rkarma) {
@@ -877,7 +958,8 @@ static int clientw(client_data* cd) {
   return 0;
 }
 
-static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo) {
+static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
+                   int sctl) {
   struct epoll_event ev, events[MAX_EVENTS];
 
   int epollfd = epoll_create(10);
@@ -892,6 +974,16 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo) {
   if(epoll_ctl(epollfd, EPOLL_CTL_ADD, sserv, &ev)) {
     perror("epoll_ctl");
     return 1;
+  }
+
+  if(sctl != -1) {
+    memset(&ev, 0, sizeof(ev));
+    ev.events = EPOLLIN;
+    ev.data.ptr = &sctl;
+    if(epoll_ctl(epollfd, EPOLL_CTL_ADD, sctl, &ev)) {
+      perror("epoll_ctl");
+      return 1;
+    }
   }
 
   mux_context* mmc = NULL;
@@ -921,7 +1013,36 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo) {
 
     struct epoll_event* ei,* ee;
     for(ei = events, ee = events + nfds; ei != ee; ++ei) {
-      if(!ei->data.ptr) {
+      if(ei->data.ptr == &sctl) {
+        union {
+          struct sockaddr_in addrin;
+          struct sockaddr addr;
+        } cli_addr;
+        socklen_t cli_len = sizeof(cli_addr.addrin);
+        int cs = accept(sctl, &cli_addr.addr, &cli_len);
+        if(cs == -1) {
+          perror("accept");
+          return 1;
+        }
+
+        uint32_t rtt = 0xFFFFFFFFU;
+        uint32_t rttvar = 0xFFFFFFFFU;
+        struct tcp_info info;
+        socklen_t tcp_info_length = sizeof(info);
+        if(0 == getsockopt(context_list->mainfd ,SOL_TCP, TCP_INFO,
+           &info, &tcp_info_length)) {
+          rtt = info.tcpi_rtt;
+          rttvar = info.tcpi_rttvar;
+        }
+        rtt = htonl(rtt);
+        rttvar = htonl(rttvar);
+        write(cs, &rtt, sizeof(rtt));
+        write(cs, &rttvar, sizeof(rttvar));
+        
+        char buf[64];
+        write(cs, buf, sprintf(buf, "\n%u %u\n", ntohl(rtt), ntohl(rttvar)));
+        close(cs);
+      } else if(!ei->data.ptr) {
         union {
           struct sockaddr_in addrin;
           struct sockaddr addr;
@@ -1013,6 +1134,7 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo) {
     if(mc) do {
       client_data* cd = mc->burn_list;
       while(cd) {
+        assert(cd->is_burned);
         client_data* ocd = cd->burn_next;
         free(cd);
         cd = ocd;
@@ -1021,7 +1143,7 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo) {
 
       mux_context* nmc = mc->next_context;
       if(mc->is_burned) {
-        context_list = context_list == mc ? mc->next_context : context_list;
+        if(context_list == mc) context_list = mc == nmc ? NULL : nmc;
         mc->next_context->prev_context = mc->prev_context;
         mc->prev_context->next_context = mc->next_context;
         free_context(mc);
