@@ -562,12 +562,23 @@ static int initiate_main_connect(mux_context* mc) {
   mc->handshake_st = KEYSZ;
 
   if(setnonblocking(mc->mainfd)) return 1;
-  if(connect(mc->mainfd, mc->caddrinfo->ai_addr, mc->caddrinfo->ai_addrlen)) {
-    if(errno != EINPROGRESS) {
+
+  int res;
+  while((res = connect(mc->mainfd, mc->caddrinfo->ai_addr,
+                       mc->caddrinfo->ai_addrlen))) {
+    if(errno == EINPROGRESS) {
+      break;
+    } else if(errno == ENETUNREACH) {
+      struct timespec ts;
+      ts.tv_sec = 8;
+      ts.tv_nsec = 0;
+      nanosleep(&ts, NULL);
+    } else {
       perror("connect");
       return 1;
     }
-  } else {
+  }
+  if(res == 0) {
     /* Uncommon case (does it ever happen?).  Connection finished
      * immediately. */
     mc->is_connecting = 0;
@@ -810,7 +821,7 @@ static int mainw(mux_context* mc) {
   /* Make sure we're not still doing a handshake. */
   if(mc->handshake_st < KEYSZ + (int)sizeof(int)) return 0;
 
-  while(mc->write_head) {
+  while(mc->write_head || mc->stream_debt > 0) {
     while(mc->stream_debt > 0) {
       VLOG("Absolving stream debt");
       int pos = mc->stream_pos - mc->stream_debt;
