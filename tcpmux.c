@@ -38,7 +38,21 @@
 #define VLOG(s) //puts(s)
 #define VVLOG(s) //puts(s)
 
+/* Indicates how long it takes for a broken connection on the demux side to have
+ * its associated state erased. */
+#define MUX_TIMEOUT 30*60*1000 // In ms
+#define RTT_INFINITE 10*1000*1000 // In us
+
 static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo, int sctl);
+
+static int get_time() {
+  struct timeval tv;
+  if(-1 == gettimeofday(&tv, NULL)) {
+    perror("gettimeofday");
+    return -1;
+  }
+  return tv.tv_sec * 1000000 + tv.tv_usec; /* Overflow is OK here. */
+}
 
 static int setnonblocking(int s) {
   assert(s != -1);
@@ -306,6 +320,7 @@ typedef struct mux_context {
   int is_connecting;
   int is_burned;
   int handshake_st;
+  int last_activity;
 
   int demux;
   int epollfd;
@@ -504,6 +519,7 @@ mux_context* make_context(int demux, int epollfd, struct addrinfo* caddrinfo) {
     mc->next_context->prev_context = mc;
     mc->prev_context->next_context = mc;
   }
+  mc->last_activity = get_time();
   mc->demux = demux;
   mc->epollfd = epollfd;
   mc->caddrinfo = caddrinfo;
@@ -513,8 +529,33 @@ mux_context* make_context(int demux, int epollfd, struct addrinfo* caddrinfo) {
   return mc;
 }
 
+static void free_client(client_data* cd) {
+  if(cd->s != -1) {
+    if(epoll_ctl(cd->context->epollfd, EPOLL_CTL_DEL, cd->s, NULL)) {
+      perror("epoll_ctl");
+    }
+    close(cd->s);
+    cd->s = -1;
+  }
+  free(cd);
+}
+
 static void free_context(mux_context* mc) {
-  // TODO: Deep free
+  int i;
+  for(i = 0; i < mc->client_table_size; i++) {
+    client_data* cd = mc->client_table[i];
+    if(cd) {
+      free_client(cd);
+    }
+  }
+  if(mc->mainfd != -1) {
+    if(epoll_ctl(mc->epollfd, EPOLL_CTL_DEL, mc->mainfd, NULL)) {
+      perror("epoll_ctl");
+    }
+    close(mc->mainfd);
+    mc->mainfd = -1;
+  }
+  free(mc->client_table);
   free(mc);
 }
 
@@ -1035,7 +1076,7 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
   }
 
   while(1) {
-    int nfds = epoll_wait(epollfd, events, MAX_EVENTS, -1);
+    int nfds = epoll_wait(epollfd, events, MAX_EVENTS, MUX_TIMEOUT);
     if(nfds == -1) {
       if(errno == EINTR) {
         /* This is for testing purposes only. */
@@ -1050,6 +1091,7 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
       perror("epoll_wait");
       return 1;
     }
+    long long time_now = get_time();
 
     struct epoll_event* ei,* ee;
     for(ei = events, ee = events + nfds; ei != ee; ++ei) {
@@ -1065,8 +1107,8 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
           return 1;
         }
 
-        uint32_t rtt = 0xFFFFFFFFU;
-        uint32_t rttvar = 0xFFFFFFFFU;
+        uint32_t rtt = RTT_INFINITE;
+        uint32_t rttvar = RTT_INFINITE;
         struct tcp_info info;
         socklen_t tcp_info_length = sizeof(info);
         if(0 == getsockopt(context_list->mainfd ,SOL_TCP, TCP_INFO,
@@ -1118,17 +1160,17 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
         int cs = accept(sserv, &cli_addr.addr, &cli_len);
         if(cs == -1) {
           perror("accept");
-          return 1;
+          goto bail_accept;
         }
 
-        if(setnonblocking(cs)) return 1;
+        if(setnonblocking(cs)) goto bail_accept;
         if(demux) {
           /* Make a preliminary context.  We may match it up with an existing
            * context later. */
           VLOG("Got new connection.  Creating mux context...");
           mux_context* mc = make_context(demux, epollfd, caddrinfo);
           if(!mc) {
-            return 1;
+            goto bail_accept;
           }
           mc->mainfd = cs;
           ev.data.ptr = mc;
@@ -1136,7 +1178,7 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
           VLOG("Got new connection.  Creating client...");
           client_data* cd = allocate_client(mmc, -1);
           if(!cd) {
-            return 1;
+            goto bail_accept;
           }
           cd->s = cs;
           ev.data.ptr = cd;
@@ -1146,8 +1188,12 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
         ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
         if(epoll_ctl(epollfd, EPOLL_CTL_ADD, cs, &ev)) {
           perror("epoll_ctl");
-          return 1;
+          goto bail_accept;
         }
+        continue;
+
+bail_accept:
+        if(cs != -1) close(cs);
       } else if(*(int*)ei->data.ptr) {
         /* It's a client. */
         client_data* cd = (client_data*)ei->data.ptr;
@@ -1162,14 +1208,20 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
             continue;
           }
         }
-        int res;
+        cd->context->last_activity = time_now;
+
+        int res = 0;
         if(ei->events & EPOLLIN) {
           VVLOG("Client ready to read");
-          if((res = clientr(cd))) return res;
+          res = clientr(cd);
         }
-        if(ei->events & EPOLLOUT) {
+        if(!res) if(ei->events & EPOLLOUT) {
           VVLOG("Client ready to write");
-          if((res = clientw(cd))) return res;
+          res = clientw(cd);
+        }
+        if(res) {
+          if(!demux) return res;
+          cd->context->is_burned = 1;
         }
       } else {
         /* It's the main file descriptor. */
@@ -1184,14 +1236,20 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
             continue;
           }
         }
-        int res;
+        mc->last_activity = time_now;
+
+        int res = 0;
         if(ei->events & EPOLLIN) {
           VLOG("Main ready to read");
-          if((res = mainr(mc))) return res;
+          res = mainr(mc);
         }
-        if(ei->events & EPOLLOUT) {
+        if(!res) if(ei->events & EPOLLOUT) {
           VLOG("Main ready to write");
-          if((res = mainw(mc))) return res;
+          res = mainw(mc);
+        }
+        if(res) {
+          if(!demux) return res;
+          mc->is_burned = 1;
         }
       }
     }
@@ -1203,13 +1261,14 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
       while(cd) {
         assert(cd->is_burned);
         client_data* ocd = cd->burn_next;
-        free(cd);
+        free_client(cd);
         cd = ocd;
       }
       mc->burn_list = NULL;
 
       mux_context* nmc = mc->next_context;
-      if(mc->is_burned) {
+      if(mc->is_burned || time_now - mc->last_activity > MUX_TIMEOUT) {
+        VLOG("Burning context");
         if(context_list == mc) context_list = mc == nmc ? NULL : nmc;
         mc->next_context->prev_context = mc->prev_context;
         mc->prev_context->next_context = mc->next_context;
