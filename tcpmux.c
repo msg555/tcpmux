@@ -51,7 +51,7 @@ static int get_time() {
     perror("gettimeofday");
     return -1;
   }
-  return tv.tv_sec * 1000000 + tv.tv_usec; /* Overflow is OK here. */
+  return tv.tv_sec * 1000 + tv.tv_usec / 1000; /* Overflow is OK here. */
 }
 
 static int setnonblocking(int s) {
@@ -86,6 +86,7 @@ int main(int argc, char** argv) {
   char* str;
   int demux = 0;
   int retry_dns = 0;
+  int daemon = 0;
   char* ctladdr = NULL;
   char* ctlport = NULL;
   if(*argv) for(++argv, --argc; *argv && (*argv)[0] == '-'; ++argv, --argc) {
@@ -103,6 +104,8 @@ int main(int argc, char** argv) {
           ctlport = str + 1;
         }
       }
+    } else if(!strcmp("--daemon", *argv)) {
+      daemon = 1;
     }
   }
 
@@ -241,6 +244,23 @@ int main(int argc, char** argv) {
       perror("listen");
       return 1;
     }
+  }
+
+  if(daemon) {
+    pid_t pid = fork();
+    if(pid == -1) {
+      perror("fork (failed to daemonize");
+      return 1;
+    }
+    if(pid != 0) {
+      return 0;
+    }
+    if(-1 == setsid()) {
+      return 1;
+    }
+    freopen("/dev/null", "r", stdin);
+    freopen("/dev/null", "w", stdout);
+    freopen("/dev/null", "w", stderr);
   }
 
   int iter;
@@ -1176,6 +1196,7 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
           ev.data.ptr = mc;
         } else {
           VLOG("Got new connection.  Creating client...");
+          mmc->last_activity = time_now;
           client_data* cd = allocate_client(mmc, -1);
           if(!cd) {
             goto bail_accept;
@@ -1267,7 +1288,8 @@ bail_accept:
       mc->burn_list = NULL;
 
       mux_context* nmc = mc->next_context;
-      if(mc->is_burned || time_now - mc->last_activity > MUX_TIMEOUT) {
+      if((mc->is_burned || time_now - mc->last_activity > MUX_TIMEOUT) &&
+          mc != mmc) {
         VLOG("Burning context");
         if(context_list == mc) context_list = mc == nmc ? NULL : nmc;
         mc->next_context->prev_context = mc->prev_context;
