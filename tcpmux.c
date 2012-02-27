@@ -880,6 +880,7 @@ static int mainr(mux_context* mc) {
       }
     }
   }
+  return 0;
 }
 
 static int mainw(mux_context* mc) {
