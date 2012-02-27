@@ -196,11 +196,6 @@ int main(int argc, char** argv) {
   }
   freeaddrinfo(baddrinfo);
 
-  /* Set the socket listening. */
-  if(listen(sserv, 16)) {
-    perror("listen");
-    return 1;
-  }
 
   int sctl = -1;
   if(ctlport) {
@@ -238,12 +233,6 @@ int main(int argc, char** argv) {
       return 1;
     }
     freeaddrinfo(ctladdrinfo);
-
-    /* Set the socket listening. */
-    if(listen(sctl, 16)) {
-      perror("listen");
-      return 1;
-    }
   }
 
   if(daemon) {
@@ -292,6 +281,18 @@ int main(int argc, char** argv) {
       }
     }
     break;
+  }
+
+  /* Set the server socket listening (and control socket if needed). */
+  if(listen(sserv, 16)) {
+    perror("listen");
+    return 1;
+  }
+  if(ctlport) {
+    if(listen(sctl, 16)) {
+      perror("listen");
+      return 1;
+    }
   }
 
   res = muxloop(sserv, demux, caddrinfo, sctl);
@@ -1127,22 +1128,24 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
           return 1;
         }
 
-        uint32_t rtt = RTT_INFINITE;
-        uint32_t rttvar = RTT_INFINITE;
+        uint32_t rtt = htonl(RTT_INFINITE);
+        uint32_t rttvar = htonl(RTT_INFINITE);
+        uint32_t spos = htonl(context_list->stream_pos);
         struct tcp_info info;
         socklen_t tcp_info_length = sizeof(info);
-        if(0 == getsockopt(context_list->mainfd ,SOL_TCP, TCP_INFO,
+        if(!context_list->is_connecting &&
+           0 == getsockopt(context_list->mainfd, SOL_TCP, TCP_INFO,
            &info, &tcp_info_length)) {
-          rtt = info.tcpi_rtt;
-          rttvar = info.tcpi_rttvar;
+          rtt = htonl(info.tcpi_rtt);
+          rttvar = htonl(info.tcpi_rttvar);
         }
-        rtt = htonl(rtt);
-        rttvar = htonl(rttvar);
         write(cs, &rtt, sizeof(rtt));
         write(cs, &rttvar, sizeof(rttvar));
+        write(cs, &spos, sizeof(spos));
         
         char buf[64];
-        write(cs, buf, sprintf(buf, "\n%u %u\n", ntohl(rtt), ntohl(rttvar)));
+        write(cs, buf, sprintf(buf, "\n%u\n%u\n%u\n", ntohl(rtt), ntohl(rttvar),
+                               ntohl(spos)));
         close(cs);
       } else if(ei->data.ptr == &snl) {
         int len;
