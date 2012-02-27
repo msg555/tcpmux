@@ -421,7 +421,7 @@ static int initiate_client_connect(client_data* cd) {
   ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
   ev.data.ptr = cd;
   if(epoll_ctl(epollfd, EPOLL_CTL_ADD, cd->s, &ev)) {
-    perror("epoll_ctl");
+    perror("epoll_ctl 1");
     return 1;
   }
   return 0;
@@ -463,7 +463,7 @@ static int disconnect_client(client_data* cd, int from_mainw) {
   VLOG("Disconnecting client");
   mux_context* mc = cd->context;
   if(epoll_ctl(mc->epollfd, EPOLL_CTL_DEL, cd->s, NULL)) {
-    perror("epoll_ctl");
+    perror("epoll_ctl 2");
     return 1;
   }
   close(cd->s);
@@ -553,7 +553,7 @@ mux_context* make_context(int demux, int epollfd, struct addrinfo* caddrinfo) {
 static void free_client(client_data* cd) {
   if(cd->s != -1) {
     if(epoll_ctl(cd->context->epollfd, EPOLL_CTL_DEL, cd->s, NULL)) {
-      perror("epoll_ctl");
+      perror("epoll_ctl 3");
     }
     close(cd->s);
     cd->s = -1;
@@ -571,7 +571,7 @@ static void free_context(mux_context* mc) {
   }
   if(mc->mainfd != -1) {
     if(epoll_ctl(mc->epollfd, EPOLL_CTL_DEL, mc->mainfd, NULL)) {
-      perror("epoll_ctl");
+      perror("epoll_ctl 4");
     }
     close(mc->mainfd);
     mc->mainfd = -1;
@@ -656,7 +656,7 @@ static int initiate_main_connect(mux_context* mc) {
   ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
   ev.data.ptr = mc;
   if(epoll_ctl(epollfd, EPOLL_CTL_ADD, mc->mainfd, &ev)) {
-    perror("epoll_ctl");
+    perror("epoll_ctl 5");
     return 1;
   }
   return 0;
@@ -753,20 +753,20 @@ static void write_ack(mux_context* mc) {
 
 static int disconnect_main(mux_context* mc) {
   VLOG("Disconnecting main");
-  if(epoll_ctl(mc->epollfd, EPOLL_CTL_DEL, mc->mainfd, NULL)) {
-    perror("epoll_ctl");
-    return 1;
+  if(mc->mainfd != -1) {
+    if(epoll_ctl(mc->epollfd, EPOLL_CTL_DEL, mc->mainfd, NULL)) {
+      perror("epoll_ctl 6");
+      return 1;
+    }
+    close(mc->mainfd);
+    mc->mainfd = -1;
   }
-  close(mc->mainfd);
-  mc->mainfd = -1;
   return mc->demux ? 0 : initiate_main_connect(mc);
 }
 
 static int mainr(mux_context* mc) {
-  if(mc->is_burned || mc->mainfd == -1 || mc->is_connecting) return 0;
-
   int hdr = sizeof(message) - VPACKETSIZE;
-  while(1) {
+  while(!mc->is_burned && mc->mainfd != -1 && !mc->is_connecting) {
     void* buf;
     size_t count;
     int rsz = -1;
@@ -814,6 +814,7 @@ static int mainr(mux_context* mc) {
 
             ctx->handshake_st = mc->handshake_st;
             ctx->mainfd = mc->mainfd;
+            mc->mainfd = -1;
             mc->is_burned = 1;
             mc = ctx;
 
@@ -822,7 +823,7 @@ static int mainr(mux_context* mc) {
             ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
             ev.data.ptr = mc;
             if(epoll_ctl(mc->epollfd, EPOLL_CTL_MOD, mc->mainfd, &ev)) {
-              perror("epoll_ctl");
+              perror("epoll_ctl 7");
               return 1;
             }
             break;
@@ -1049,7 +1050,7 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
   ev.events = EPOLLIN;
   ev.data.ptr = NULL;
   if(epoll_ctl(epollfd, EPOLL_CTL_ADD, sserv, &ev)) {
-    perror("epoll_ctl");
+    perror("epoll_ctl 8");
     return 1;
   }
 
@@ -1058,7 +1059,7 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
     ev.events = EPOLLIN;
     ev.data.ptr = &sctl;
     if(epoll_ctl(epollfd, EPOLL_CTL_ADD, sctl, &ev)) {
-      perror("epoll_ctl");
+      perror("epoll_ctl 9");
       return 1;
     }
   }
@@ -1091,7 +1092,7 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
     ev.events = EPOLLIN;
     ev.data.ptr = &snl;
     if(epoll_ctl(epollfd, EPOLL_CTL_ADD, snl, &ev)) {
-      perror("epoll_ctl");
+      perror("epoll_ctl 10");
       return 1;
     }
   }
@@ -1211,7 +1212,7 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo,
           
         ev.events = EPOLLIN | EPOLLOUT | EPOLLET;
         if(epoll_ctl(epollfd, EPOLL_CTL_ADD, cs, &ev)) {
-          perror("epoll_ctl");
+          perror("epoll_ctl 11");
           goto bail_accept;
         }
         continue;
