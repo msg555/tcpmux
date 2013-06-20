@@ -4,6 +4,7 @@
 #include "tcpmux.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -21,6 +22,7 @@ void LinkServer::read() {
   for(;;) {
     int cs = TEMP_FAILURE_RETRY(accept(s, NULL, NULL));
     if(cs == -1) {
+      perror("accept LinkServer::read");
       break;
     }
     DPRINTF("Got new link on fd:%d\n", cs);

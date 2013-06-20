@@ -31,7 +31,7 @@ LinkStream::LinkStream(MuxContext* ctx, Stream* lower_link)
     key_seed = time(NULL);
   }
   for(size_t i = 0; i < LINKSTREAM_KEY_SIZE; i++) {
-    key[i] = rand_r(&key_seed) & 0xFF;
+    key[i] = rand(); //rand_r(&key_seed) & 0xFF;
   }
   key_pos = LINKSTREAM_KEY_SIZE;
   out_pos = sizeof(out) - LINKSTREAM_KEY_SIZE - 4;
@@ -104,8 +104,6 @@ size_t LinkStream::push(Stream* source, const char* data, size_t count) {
           /* Cleanup! */
           streams.erase(it);
           delete lnk;
-
-DPRINTF("LINKED %zu %zu!\n", buf_pos, buf_size);
         } else {
           forward = factory->create(this);
         }
@@ -124,14 +122,13 @@ DPRINTF("LINKED %zu %zu!\n", buf_pos, buf_size);
       data += amt; count -= amt;
       if(link_read_state == 0) {
         acked_pos = ntohl(acked_pos);
-DPRINTF("Set ack pos %u %zu %zu\n", acked_pos, buf_pos, buf_size);
         buf_size = (buf_pos + buf_size - acked_pos) &
                     (LINKSTREAM_MAX_UNACKED - 1);
         buf_pos = acked_pos;
         drain();
       }
     } else if(link_read_state < 2) {
-      size_t amt = min(count, 2UL - link_read_state);
+      size_t amt = min(count, (size_t)(2UL - link_read_state));
       memcpy((char*)&vpacket_len + link_read_state, data, amt);
       link_read_state += amt;
       data += amt; count -= amt;
@@ -186,6 +183,7 @@ void LinkStream::replace_stream(Stream* old_stream, Stream* new_stream) {
   lower_link = new_stream;
   lower_link->attach_stream(this);
 
+  unacked_bytes = 0;
   link_read_state = -4;
   out_pos = sizeof(out) - LINKSTREAM_KEY_SIZE - 4;
   memcpy(out + out_pos, key, LINKSTREAM_KEY_SIZE);
@@ -215,9 +213,10 @@ void LinkStream::drain() {
       }
     }
 
-    out_pos += lower_link->push(this, out + out_pos, sizeof(out) - out_pos);
-    if(out_pos < sizeof(out)) {
+    size_t amt = lower_link->push(this, out + out_pos, sizeof(out) - out_pos);
+    if(amt == 0) {
       break;
     }
+    out_pos += amt;
   }
 }

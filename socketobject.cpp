@@ -1,12 +1,13 @@
 #include "eventwatcher.h"
 #include "socketobject.h"
+#include "tcpmux.h"
 
 #include <errno.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
 
-#include "tcpmux.h"
+#include <stdio.h>
 
 SocketObject::SocketObject(EventWatcher* watcher, int s)
     : watcher(watcher), s(s), forward(NULL), opts(0), buf_pos(0), buf_size(0) {

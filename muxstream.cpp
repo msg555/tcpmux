@@ -16,7 +16,6 @@ MuxStream::MuxStream(MuxContext* ctx, Stream* lower_link, Connector* connector)
     : ctx(ctx), lower_link(lower_link), connector(connector),
       ll_state(-4), ll_client(NULL), vpacket_pos(0), vpacket_size(0),
       write_head(NULL), write_tail(NULL) {
-DPRINTF("MUXSTREAM CREATED %p\n", this);
   memset(clients, 0, sizeof(clients));
   if(ctx->muxserv) {
     assert(!connector);
@@ -50,7 +49,6 @@ size_t MuxStream::push(Stream* source, const char* data, size_t count) {
             if(ll_client->client_id & DELETE_ID_BIT) {
               /* If we already sent a disconnect message delete now. */
               assert(ll_client->client_stream == NULL);
-DPRINTF("FREE ID %u\n", ll.val.id & ~DELETE_ID_BIT);
               clients[ll.val.id & ~DELETE_ID_BIT] = NULL;
               delete ll_client;
             } else if(ll_client->client_stream) {
@@ -97,11 +95,16 @@ DPRINTF("FREE ID %u\n", ll.val.id & ~DELETE_ID_BIT);
     /* Prepare a virtual packet for transmission if nothing is already being
      * staged. */
     MuxedClient* client = static_cast<MuxedClient*>(source);
-    for(drain(); 0UL < count &&
-          client->unacked_bytes < MUXSTREAM_CLIENT_BUFFER_SIZE; drain()) {
-      if(vpacket_pos == vpacket_size) {
+    if(client->next) {
+      /* Client is already queued to write data. */
+    } else {
+      for(drain(); vpacket_pos == vpacket_size; drain()) {
+        /* Create a virtual packet. */
         size_t amt = min(MUXSTREAM_CLIENT_BUFFER_SIZE - client->unacked_bytes,
                          min(count, MUXSTREAM_MAX_VPACKET));
+        if(amt == 0) {
+          break;
+        }
 
         vpacket_pos = 0;
         vpacket_size = amt + 4;
@@ -111,9 +114,11 @@ DPRINTF("FREE ID %u\n", ll.val.id & ~DELETE_ID_BIT);
 
         data += amt; count -= amt;
         client->unacked_bytes += amt;
-      } else {
-        wants_write(client);
-        break;
+
+        if(write_head) {
+          /* Other clients are waiting to transmit. */
+          break;
+        }
       }
     }
   }
@@ -135,7 +140,6 @@ bool MuxStream::wants_write(MuxedClient* client) {
 }
 
 void MuxStream::wants_disconnect(MuxedClient* client) {
-DPRINTF("REQUESTING DISCONNECT %zu\n", client->client_id);
   assert(client->client_stream == NULL);
   wants_write(client);
   pop(lower_link);
@@ -143,13 +147,11 @@ DPRINTF("REQUESTING DISCONNECT %zu\n", client->client_id);
 
 bool MuxStream::pop(Stream* source) {
   if(source == lower_link) {
-DPRINTF("POPPING\n");
     for(drain(); write_head && vpacket_pos == vpacket_size; drain()) {
       MuxedClient* client = write_head;
       write_head = client->next == client ? NULL : client->next;
       client->next = NULL;
 
-      bool add = true;
       if(client->received_bytes >= MUXSTREAM_CLIENT_BUFFER_SIZE / 2) {
         /* Send off an ACK for this client if we have enough data to ack. */
         client->received_bytes -= MUXSTREAM_CLIENT_BUFFER_SIZE / 2;
@@ -158,9 +160,10 @@ DPRINTF("POPPING\n");
         vpacket_size = 4;
         reinterpret_cast<uint16_t*>(vpacket)[0] = htons(client->client_id);
         reinterpret_cast<uint16_t*>(vpacket)[1] = htons(0);
+        wants_write(client);
       } else if(client->client_stream) {
         /* Otherwise allow the client to send data. */
-        add = client->pop(this);
+        client->pop(this);
       } else {
         /* Send a disconnect and delete the stream.  Since only one endpoint
          * is assnging new ids there is no possibility for id confusion. */
@@ -172,28 +175,27 @@ DPRINTF("POPPING\n");
         reinterpret_cast<uint16_t*>(vpacket)[0] = htons(client->client_id);
         reinterpret_cast<uint16_t*>(vpacket)[1] = htons(0);
 
-DPRINTF("TRANSMIT DISCONNECT %zu\n", client->client_id & DELETE_ID_BIT);
         if(need_delete) {
-DPRINTF("FREE ID %zu\n", client->client_id & ~DELETE_ID_BIT);
           clients[client->client_id & ~DELETE_ID_BIT] = NULL;
           delete client;
         }
-        add = false;
-      }
-      if(add) {
-        wants_write(client);
       }
     }
     return vpacket_pos < vpacket_size;
   } else {
     assert(0 && "muxedclient's should not call to pop");
+    return false;
   }
 }
 
 void MuxStream::drain() {
-  if(vpacket_pos < vpacket_size) {
-    vpacket_pos += lower_link->push(this, vpacket + vpacket_pos,
-                                    vpacket_size - vpacket_pos);
+  while(vpacket_pos < vpacket_size) {
+    size_t amt = lower_link->push(this, vpacket + vpacket_pos,
+                                  vpacket_size - vpacket_pos);
+    if(amt == 0) {
+      break;
+    }
+    vpacket_pos += amt;
   }
 }
 
@@ -256,7 +258,6 @@ size_t MuxedClient::push(Stream* source, const char* data, size_t count) {
     result += amt;
     drain();
   }
-DPRINTF("RECEIVING %zu -> %zu\n", client_id, result);
 
   return result;
 }
