@@ -101,18 +101,6 @@ int initiate_connect(struct addrinfo* caddrinfo) {
   return s;
 }
 
-void reset_connecting_link(MuxContext* ctx) {
-  for(size_t i = 0; i < ctx->links.size(); ++i) {
-    delete ctx->links[i];
-  }
-  ctx->links.resize(0);
-
-  Stream* sstream = ctx->connector->connect();
-  LinkStream* lstream = new LinkStream(ctx, sstream, ctx->factory);
-  sstream->set_forward(lstream);
-  ctx->links.push_back(sstream);
-}
-
 void MuxContext::add_descriptor(EventObject* obj, int fd, int opts) {
   struct epoll_event ev;
   memset(&ev, 0, sizeof(ev));
@@ -135,9 +123,12 @@ void MuxContext::mod_descriptor(EventObject* obj, int fd, int opts) {
   }
 }
 
-void MuxContext::del_descriptor(int fd) {
+void MuxContext::del_descriptor(EventObject* obj, int fd) {
   if(epoll_ctl(epollfd, EPOLL_CTL_DEL, fd, (struct epoll_event*)-1)) {
     perror("epoll_ctl del_descriptor");
+  }
+  if(obj) {
+    delete_list.push_back(obj);
   }
 }
 
@@ -149,8 +140,6 @@ int main(int argc, char** argv) {
   int demux = 0;
   int retry_dns = 0;
   int daemon = 0;
-  char* ctladdr = NULL;
-  char* ctlport = NULL;
   if(*argv) for(++argv, --argc; *argv && (*argv)[0] == '-'; ++argv, --argc) {
     if(!strcmp("--demux", *argv)) {
       demux = 1;
@@ -179,8 +168,6 @@ int main(int argc, char** argv) {
     //printf("  --ssl     : Encrypt stream with SSL\n");
     printf("  --retry   : "
                   "Keep trying to resolve connect host until it suceeds\n");
-    printf("  --control [control_bind_addr:]control_bind_port : "
-           "Start control server\n");
     // TODO: Add max client switch
     // TODO: Need to provide keys?
     return 0;
@@ -208,7 +195,6 @@ int main(int argc, char** argv) {
   struct addrinfo hints;
   struct addrinfo* baddrinfo;
   struct addrinfo* caddrinfo;
-  struct addrinfo* ctladdrinfo;
 
   /* Create the listening socket. */
   int sserv = socket(AF_INET, SOCK_STREAM, 0);
@@ -308,7 +294,7 @@ int main(int argc, char** argv) {
 }
 
 static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo) {
-  struct epoll_event ev, events[MAX_EVENTS];
+  struct epoll_event events[MAX_EVENTS];
 
   int epollfd = epoll_create(10);
   if(epollfd == -1) {
@@ -326,10 +312,10 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo) {
     ctx->muxserv = new MuxServer(ctx, sserv);
 
     Stream* sstream = ctx->connector->connect();
-    LinkStream* lstream = new LinkStream(ctx, sstream);
-    MuxStream* mstream = new MuxStream(ctx, lstream, NULL);
-    lstream->set_forward(mstream);
-    sstream->set_forward(lstream);
+    ctx->lstream = new LinkStream(ctx, sstream);
+    MuxStream* mstream = new MuxStream(ctx, ctx->lstream, NULL);
+    ctx->lstream->attach_stream(mstream);
+    sstream->attach_stream(ctx->lstream);
   }
 
   for(;;) {
@@ -346,5 +332,10 @@ static int muxloop(int sserv, int demux, struct addrinfo* caddrinfo) {
         eo->write();
       }
     }
+    for(typeof(ctx->delete_list.begin()) it = ctx->delete_list.begin();
+        it != ctx->delete_list.end(); ++it) {
+      delete *it;
+    }
+    ctx->delete_list.clear();
   }
 }

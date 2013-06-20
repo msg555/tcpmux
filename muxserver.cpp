@@ -20,7 +20,6 @@ MuxServer::~MuxServer() {
 }
 
 void MuxServer::associate_mux(MuxStream* mstream) {
-DPRINTF("GOT ASSOC %p\n", mstream);
   if(!mstream != !this->mstream) {
     DPRINTF("CHANGE DESC %d\n", mstream ? EventWatcher::READ : 0);
     ctx->mod_descriptor(this, s, mstream ? EventWatcher::READ : 0);
@@ -29,7 +28,6 @@ DPRINTF("GOT ASSOC %p\n", mstream);
 }
 
 void MuxServer::read() {
-DPRINTF("MUXSERVER READ\n");
   if(mstream) for(;;) {
     int cs = TEMP_FAILURE_RETRY(accept(s, NULL, NULL));
     if(cs == -1) {

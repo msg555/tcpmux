@@ -10,7 +10,7 @@ class EventWatcher {
 
   virtual void add_descriptor(EventObject* obj, int fd, int opts) = 0;
   virtual void mod_descriptor(EventObject* obj, int fd, int opts) = 0;
-  virtual void del_descriptor(int fd) = 0;
+  virtual void del_descriptor(EventObject* obj, int fd) = 0;
 };
 
 #endif

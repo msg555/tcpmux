@@ -3,6 +3,7 @@
 
 #include "eventwatcher.h"
 
+#include <list>
 #include <vector>
 
 #include <stddef.h>
@@ -18,7 +19,7 @@
 #define DPRINTF(...)
 #endif
 
-class Stream;
+class LinkStream;
 class NetlinkMonitor;
 class LinkServer;
 class MuxServer;
@@ -29,20 +30,22 @@ struct addrinfo;
 
 struct MuxContext : public EventWatcher {
   MuxContext(int epollfd, bool demux)
-      : netlink(NULL), linkserv(NULL), muxserv(NULL), factory(NULL),
-        connector(NULL), epollfd(epollfd), demux(demux) {
+      : lstream(NULL), netlink(NULL), linkserv(NULL), muxserv(NULL),
+        factory(NULL), connector(NULL), epollfd(epollfd), demux(demux) {
   }
 
   virtual void add_descriptor(EventObject* obj, int fd, int opts);
   virtual void mod_descriptor(EventObject* obj, int fd, int opts);
-  virtual void del_descriptor(int fd);
+  virtual void del_descriptor(EventObject* obj, int fd);
 
-  std::vector<Stream*> links;
+  LinkStream* lstream;
   NetlinkMonitor* netlink;
   LinkServer* linkserv;
   MuxServer* muxserv;
   StreamFactory* factory;
   Connector* connector;
+
+  std::list<EventObject*> delete_list;
 
   int epollfd;
   bool demux;

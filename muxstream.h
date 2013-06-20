@@ -16,6 +16,8 @@ class MuxContext;
 class MuxedClient;
 
 class MuxStream : public Stream {
+ friend class MuxedClient;
+
  public:
   MuxStream(MuxContext* ctx, Stream* lower_link, Connector* connector);
   virtual ~MuxStream();
@@ -23,12 +25,14 @@ class MuxStream : public Stream {
   virtual size_t push(Stream* source, const char* buf, size_t count);
   virtual bool pop(Stream* source);
 
-  void attach_client(Stream* client_stream);
+  virtual void attach_client(Stream* client_stream);
+  virtual void replace_stream(Stream* old_stream, Stream* new_stream);
 
  private:
   void drain();
   MuxedClient* get_stream(uint16_t id);
   bool wants_write(MuxedClient* client);
+  void wants_disconnect(MuxedClient* client);
 
   MuxContext* ctx;
   Stream* lower_link;
@@ -62,6 +66,8 @@ class MuxedClient : public Stream {
 
   virtual size_t push(Stream* source, const char* buf, size_t count);
   virtual bool pop(Stream* source);
+
+  virtual void disconnect_stream(Stream* stream);
 
  private:
   void drain();

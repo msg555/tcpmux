@@ -27,7 +27,6 @@ void LinkServer::read() {
 
     SocketObject* sstream = new SocketObject(ctx, cs);
     LinkStream* lstream = new LinkStream(ctx, sstream, ctx->factory);
-    sstream->set_forward(lstream);
-    ctx->links.push_back(sstream);
+    sstream->attach_stream(lstream);
   }
 }

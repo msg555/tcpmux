@@ -15,18 +15,18 @@ class SocketObject : public Stream, EventObject {
   SocketObject(EventWatcher* watcher, int s);
   virtual ~SocketObject();
 
-  void set_forward(Stream* forward);
-
   virtual size_t push(Stream* source, const char* buf, size_t count);
   virtual bool pop(Stream* source);
+
+  virtual void attach_stream(Stream* stream);
+  virtual void replace_stream(Stream* old_stream, Stream* new_stream);
+  virtual void disconnect_stream(Stream* stream);
 
   virtual void read();
   virtual void write();
 
-  virtual bool alive();
-
  private:
-  void close_sock();
+  void do_close();
 
   EventWatcher* watcher;
   int s;

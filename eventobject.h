@@ -8,10 +8,6 @@ class EventObject {
 
   virtual void read() {}
   virtual void write() {}
-
-  virtual bool alive() {
-    return true;
-  }
 };
 
 #endif

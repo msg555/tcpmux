@@ -1,3 +1,5 @@
+#include "connector.h"
+#include "linkstream.h"
 #include "netlink.h"
 
 #include "tcpmux.h"
@@ -67,7 +69,7 @@ void NetlinkMonitor::read() {
   if(new_addr) {
     /* Network interfaces have changed.  Let's try connecting again
      * to make sure we have the best interface. */
-    reset_connecting_link(ctx);
+    ctx->lstream->replace_stream(NULL, ctx->connector->connect());
   }
 }
 

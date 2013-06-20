@@ -18,11 +18,15 @@ class Stream {
    * Returning true indicates that there is still more data to write. */
   virtual bool pop(Stream* source) = 0;
 
-  /* Streams that forward data to another stream may have their forwarding
-   * stream set with this function.  This way the forwarding stream does
-   * not need to be set during construction. */
-  virtual void set_forward(Stream* forward) {
-    assert(0 && "cannot set forward stream");
+  virtual void attach_stream(Stream* stream) {
+    assert(0 && "attach_stream not supported on stream");
+  }
+
+  virtual void replace_stream(Stream* old_stream, Stream* new_stream) {
+    assert(0 && "replace_stream not supported on stream");
+  }
+
+  virtual void disconnect_stream(Stream* stream) {
   }
 };
 
